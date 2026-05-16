@@ -10,6 +10,7 @@
 //! - Struct types are emitted as named LLVM struct types
 //! - Enums use tagged union representation: { i32 tag, [max_payload x i8] }
 
+use crate::semantics::std as vita_std;
 use crate::semantics::types::{Type, TypeEnv, TypeInfo};
 use crate::syntax::ast::*;
 
@@ -154,8 +155,15 @@ impl CodeGen {
         self.emit("declare i32 @printf(ptr, ...)");
         self.emit("declare i32 @puts(ptr)");
         self.emit("declare i32 @sprintf(ptr, ptr, ...)");
+        self.emit("declare ptr @fopen(ptr, ptr)");
+        self.emit("declare i32 @fclose(ptr)");
+        self.emit("declare i32 @fseek(ptr, i64, i32)");
+        self.emit("declare i64 @ftell(ptr)");
+        self.emit("declare i64 @fread(ptr, i64, i64, ptr)");
+        self.emit("declare i64 @fwrite(ptr, i64, i64, ptr)");
         self.emit("declare ptr @strcpy(ptr, ptr)");
         self.emit("declare ptr @strcat(ptr, ptr)");
+        self.emit("declare i32 @strcmp(ptr, ptr)");
         self.emit("declare i64 @strlen(ptr)");
         self.emit("declare ptr @malloc(i64)");
         self.emit("declare void @free(ptr)");
@@ -474,11 +482,19 @@ impl CodeGen {
                 type_ann,
                 value,
             } => {
-                let val = self.emit_expr(value);
                 let ty = type_ann
                     .as_ref()
                     .map(|t| self.resolve_type_expr_simple(t))
                     .unwrap_or_else(|| self.infer_type_of_expr(value));
+                let val = match (&ty, value) {
+                    (Type::DynArray(elem), Expr::ArrayLiteral(elements)) => {
+                        self.emit_dyn_array_literal(elem, elements)
+                    }
+                    (Type::DynArray(elem), Expr::RepeatLiteral { value, count }) => {
+                        self.emit_dyn_array_repeat(elem, value, count)
+                    }
+                    _ => self.emit_expr(value),
+                };
 
                 // Register the variable type so subsequent lookups are correct
                 self.env.define_var(name.clone(), ty.clone());
@@ -660,6 +676,31 @@ impl CodeGen {
                 let obj_val = self.emit_expr(object);
                 let idx_val = self.emit_expr(index);
                 let obj_type = self.infer_type_of_expr(object);
+
+                if obj_type == Type::Str {
+                    let byte_ptr = self.fresh("str_idx");
+                    self.emit_indent(&format!(
+                        "{} = getelementptr inbounds i8, ptr {}, {} {}",
+                        self.l(&byte_ptr),
+                        obj_val.to_str(),
+                        self.type_to_llvm(&self.infer_type_of_expr(index)),
+                        idx_val.to_str()
+                    ));
+                    let byte_load = self.fresh("str_byte");
+                    self.emit_indent(&format!(
+                        "{} = load i8, ptr {}",
+                        self.l(&byte_load),
+                        self.l(&byte_ptr)
+                    ));
+                    let char_val = self.fresh("str_char");
+                    self.emit_indent(&format!(
+                        "{} = zext i8 {} to i32",
+                        self.l(&char_val),
+                        self.l(&byte_load)
+                    ));
+                    return LlvmVal::Local(char_val);
+                }
+
                 let elem_type = match &obj_type {
                     Type::Array { element, .. } => *element.clone(),
                     Type::DynArray(elem) => *elem.clone(),
@@ -667,13 +708,36 @@ impl CodeGen {
                 };
                 let elem_llvm = self.type_to_llvm(&elem_type);
                 let ptr_name = self.fresh("idx");
-                self.emit_indent(&format!(
-                    "{} = getelementptr inbounds {}, ptr {}, i32 {}",
-                    self.l(&ptr_name),
-                    elem_llvm,
-                    obj_val.to_str(),
-                    idx_val.to_str()
-                ));
+                if let Type::Array { size, .. } = obj_type {
+                    self.emit_indent(&format!(
+                        "{} = getelementptr inbounds [{} x {}], ptr {}, i32 0, {} {}",
+                        self.l(&ptr_name),
+                        size,
+                        elem_llvm,
+                        obj_val.to_str(),
+                        self.type_to_llvm(&self.infer_type_of_expr(index)),
+                        idx_val.to_str()
+                    ));
+                } else if matches!(obj_type, Type::DynArray(_)) {
+                    let data_ptr = self.emit_dyn_array_data_ptr(&obj_val);
+                    self.emit_indent(&format!(
+                        "{} = getelementptr inbounds {}, ptr {}, {} {}",
+                        self.l(&ptr_name),
+                        elem_llvm,
+                        data_ptr,
+                        self.type_to_llvm(&self.infer_type_of_expr(index)),
+                        idx_val.to_str()
+                    ));
+                } else {
+                    self.emit_indent(&format!(
+                        "{} = getelementptr inbounds {}, ptr {}, {} {}",
+                        self.l(&ptr_name),
+                        elem_llvm,
+                        obj_val.to_str(),
+                        self.type_to_llvm(&self.infer_type_of_expr(index)),
+                        idx_val.to_str()
+                    ));
+                }
                 let load_name = self.fresh("iload");
                 self.emit_indent(&format!(
                     "{} = load {}, ptr {}",
@@ -704,9 +768,10 @@ impl CodeGen {
             // --- For-each loop ---
             Expr::ForEach {
                 var,
+                type_ann,
                 iterable,
                 body,
-            } => self.emit_for_each(var, iterable, body),
+            } => self.emit_for_each(var, type_ann.as_ref(), iterable, body),
 
             // --- Fallible block ---
             Expr::Fallible { block, handler } => self.emit_fallible(block, handler),
@@ -725,6 +790,10 @@ impl CodeGen {
 
             // --- Array literal ---
             Expr::ArrayLiteral(elements) => self.emit_array_literal(elements),
+
+            // --- Range/repeat literals ---
+            Expr::RangeLiteral { .. } => LlvmVal::Const("null".to_string()),
+            Expr::RepeatLiteral { value, count } => self.emit_repeat_literal(value, count),
 
             // --- Tuple literal ---
             Expr::TupleLiteral(elements) => self.emit_tuple_literal(elements),
@@ -764,6 +833,24 @@ impl CodeGen {
         // String concatenation: str + str -> str
         if *op == BinOp::Add && (lt == Type::Str || rt == Type::Str) {
             return self.emit_string_concat(&lv, &rv, &lt, &rt);
+        }
+
+        if (*op == BinOp::Eq || *op == BinOp::Neq) && lt == Type::Str && rt == Type::Str {
+            let cmp_name = self.fresh("strcmp");
+            self.emit_indent(&format!(
+                "{} = call i32 @strcmp(ptr {}, ptr {})",
+                self.l(&cmp_name),
+                lv.to_str(),
+                rv.to_str()
+            ));
+            let pred = if *op == BinOp::Eq { "eq" } else { "ne" };
+            self.emit_indent(&format!(
+                "{} = icmp {} i32 {}, 0",
+                self.l(&result_name),
+                pred,
+                self.l(&cmp_name)
+            ));
+            return LlvmVal::Local(result_name);
         }
 
         let instr = match op {
@@ -1052,6 +1139,12 @@ impl CodeGen {
                 "print" => {
                     return self.emit_builtin_print(args);
                 }
+                "read_file" => {
+                    return self.emit_builtin_read_file(args);
+                }
+                "write_file" => {
+                    return self.emit_builtin_write_file(args);
+                }
                 "sqrt" | "abs" => {
                     return self.emit_builtin_math(name, args);
                 }
@@ -1104,6 +1197,10 @@ impl CodeGen {
         let recv_val = self.emit_expr(receiver);
         let recv_type = self.infer_type_of_expr(receiver);
 
+        if let Some(value) = self.emit_std_method_call(&recv_type, &recv_val, method, args) {
+            return value;
+        }
+
         // Mangled method name: TypeName_methodName
         let mangled = match &recv_type {
             Type::Named(type_name) => format!("{}_{}", type_name, method),
@@ -1123,7 +1220,10 @@ impl CodeGen {
         let ret_type = self
             .env
             .lookup_fn(method)
-            .and_then(|fns| fns.first())
+            .and_then(|fns| {
+                fns.iter()
+                    .find(|f| f.receiver_type.as_ref() == Some(&recv_type))
+            })
             .map(|f| f.return_type.clone())
             .unwrap_or(Type::I32);
 
@@ -1142,6 +1242,218 @@ impl CodeGen {
             ));
             LlvmVal::Local(result_name)
         }
+    }
+
+    fn emit_std_method_call(
+        &mut self,
+        recv_type: &Type,
+        recv_val: &LlvmVal,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<LlvmVal> {
+        match (recv_type, method) {
+            (Type::DynArray(_), "len") if args.is_empty() => {
+                Some(self.emit_dyn_array_len(recv_val))
+            }
+            (Type::DynArray(elem), "push") if args.len() == 1 => {
+                Some(self.emit_dyn_array_push(recv_val, elem, &args[0]))
+            }
+            (Type::Str, "slice") if args.len() == 2 => Some(self.emit_string_slice(recv_val, args)),
+            _ if !args.is_empty() => None,
+            (Type::Str, "len") => {
+                let result_name = self.fresh("strlen");
+                self.emit_indent(&format!(
+                    "{} = call i64 @strlen(ptr {})",
+                    self.l(&result_name),
+                    recv_val.to_str()
+                ));
+                Some(LlvmVal::Local(result_name))
+            }
+            (Type::Str, "is_empty") => {
+                let len_name = self.fresh("strlen");
+                self.emit_indent(&format!(
+                    "{} = call i64 @strlen(ptr {})",
+                    self.l(&len_name),
+                    recv_val.to_str()
+                ));
+                let result_name = self.fresh("str_empty");
+                self.emit_indent(&format!(
+                    "{} = icmp eq i64 {}, 0",
+                    self.l(&result_name),
+                    self.l(&len_name)
+                ));
+                Some(LlvmVal::Local(result_name))
+            }
+            (Type::Char, "is_digit") => {
+                Some(self.emit_char_range_check(recv_val, "is_digit", &[('0' as u32, '9' as u32)]))
+            }
+            (Type::Char, "is_alpha") => Some(self.emit_char_range_check(
+                recv_val,
+                "is_alpha",
+                &[('a' as u32, 'z' as u32), ('A' as u32, 'Z' as u32)],
+            )),
+            (Type::Char, "is_alnum") => Some(self.emit_char_range_check(
+                recv_val,
+                "is_alnum",
+                &[
+                    ('0' as u32, '9' as u32),
+                    ('a' as u32, 'z' as u32),
+                    ('A' as u32, 'Z' as u32),
+                ],
+            )),
+            (Type::Char, "is_whitespace") => {
+                Some(self.emit_char_any_check(recv_val, "is_space", &[9, 10, 13, 32]))
+            }
+            (ty, "abs") if ty.is_signed_int() => {
+                let llvm_type = self.type_to_llvm(ty);
+                let is_neg = self.fresh("is_neg");
+                self.emit_indent(&format!(
+                    "{} = icmp slt {} {}, 0",
+                    self.l(&is_neg),
+                    llvm_type,
+                    recv_val.to_str()
+                ));
+                let neg = self.fresh("neg");
+                self.emit_indent(&format!(
+                    "{} = sub {} 0, {}",
+                    self.l(&neg),
+                    llvm_type,
+                    recv_val.to_str()
+                ));
+                let result_name = self.fresh("abs");
+                self.emit_indent(&format!(
+                    "{} = select i1 {}, {} {}, {} {}",
+                    self.l(&result_name),
+                    self.l(&is_neg),
+                    llvm_type,
+                    self.l(&neg),
+                    llvm_type,
+                    recv_val.to_str()
+                ));
+                Some(LlvmVal::Local(result_name))
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_string_slice(&mut self, recv_val: &LlvmVal, args: &[Expr]) -> LlvmVal {
+        let start_val = self.emit_expr(&args[0]);
+        let end_val = self.emit_expr(&args[1]);
+        let start_type = self.infer_type_of_expr(&args[0]);
+        let end_type = self.infer_type_of_expr(&args[1]);
+        let start = self.coerce_int_value(&start_val, &start_type, &Type::I64);
+        let end = self.coerce_int_value(&end_val, &end_type, &Type::I64);
+
+        let len = self.fresh("slice_len");
+        self.emit_indent(&format!("{} = sub i64 {}, {}", self.l(&len), end, start));
+        let alloc_size = self.fresh("slice_alloc_size");
+        self.emit_indent(&format!(
+            "{} = add i64 {}, 1",
+            self.l(&alloc_size),
+            self.l(&len)
+        ));
+        let buffer = self.fresh("slice_buf");
+        self.emit_indent(&format!(
+            "{} = call ptr @malloc(i64 {})",
+            self.l(&buffer),
+            self.l(&alloc_size)
+        ));
+        let source = self.fresh("slice_src");
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds i8, ptr {}, i64 {}",
+            self.l(&source),
+            recv_val.to_str(),
+            start
+        ));
+        self.emit_indent(&format!(
+            "call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)",
+            self.l(&buffer),
+            self.l(&source),
+            self.l(&len)
+        ));
+        let null_ptr = self.fresh("slice_null");
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds i8, ptr {}, i64 {}",
+            self.l(&null_ptr),
+            self.l(&buffer),
+            self.l(&len)
+        ));
+        self.emit_indent(&format!("store i8 0, ptr {}", self.l(&null_ptr)));
+
+        LlvmVal::Local(buffer)
+    }
+
+    fn emit_char_range_check(
+        &mut self,
+        recv_val: &LlvmVal,
+        prefix: &str,
+        ranges: &[(u32, u32)],
+    ) -> LlvmVal {
+        let mut result: Option<String> = None;
+        for (start, end) in ranges {
+            let ge = self.fresh(&format!("{}_ge", prefix));
+            self.emit_indent(&format!(
+                "{} = icmp uge i32 {}, {}",
+                self.l(&ge),
+                recv_val.to_str(),
+                start
+            ));
+            let le = self.fresh(&format!("{}_le", prefix));
+            self.emit_indent(&format!(
+                "{} = icmp ule i32 {}, {}",
+                self.l(&le),
+                recv_val.to_str(),
+                end
+            ));
+            let in_range = self.fresh(&format!("{}_range", prefix));
+            self.emit_indent(&format!(
+                "{} = and i1 {}, {}",
+                self.l(&in_range),
+                self.l(&ge),
+                self.l(&le)
+            ));
+            result = Some(if let Some(prev) = result {
+                let combined = self.fresh(prefix);
+                self.emit_indent(&format!(
+                    "{} = or i1 {}, {}",
+                    self.l(&combined),
+                    self.l(&prev),
+                    self.l(&in_range)
+                ));
+                combined
+            } else {
+                in_range
+            });
+        }
+
+        LlvmVal::Local(result.unwrap_or_else(|| "false".to_string()))
+    }
+
+    fn emit_char_any_check(&mut self, recv_val: &LlvmVal, prefix: &str, values: &[u32]) -> LlvmVal {
+        let mut result: Option<String> = None;
+        for value in values {
+            let eq = self.fresh(&format!("{}_eq", prefix));
+            self.emit_indent(&format!(
+                "{} = icmp eq i32 {}, {}",
+                self.l(&eq),
+                recv_val.to_str(),
+                value
+            ));
+            result = Some(if let Some(prev) = result {
+                let combined = self.fresh(prefix);
+                self.emit_indent(&format!(
+                    "{} = or i1 {}, {}",
+                    self.l(&combined),
+                    self.l(&prev),
+                    self.l(&eq)
+                ));
+                combined
+            } else {
+                eq
+            });
+        }
+
+        LlvmVal::Local(result.unwrap_or_else(|| "false".to_string()))
     }
 
     fn emit_builtin_print(&mut self, args: &[Expr]) -> LlvmVal {
@@ -1249,12 +1561,152 @@ impl CodeGen {
                     self.l(&result_name)
                 ));
             }
+            Type::Char => {
+                let fmt_name = self.fresh("fmt");
+                self.string_constants
+                    .push((fmt_name.clone(), "%c\n".to_string(), 4));
+                let fmt_ptr = self.fresh("fmt_ptr");
+                self.emit_indent(&format!(
+                    "{} = getelementptr inbounds [4 x i8], ptr @{}, i64 0, i64 0",
+                    self.l(&fmt_ptr),
+                    fmt_name
+                ));
+                self.emit_indent(&format!(
+                    "call i32 (ptr, ...) @printf(ptr {}, i32 {})",
+                    self.l(&fmt_ptr),
+                    val.to_str()
+                ));
+            }
             _ => {
                 // Generic: just call puts
                 self.emit_indent(&format!("call i32 @puts(ptr {})", val.to_str()));
             }
         }
         LlvmVal::Const("void".to_string())
+    }
+
+    fn emit_builtin_read_file(&mut self, args: &[Expr]) -> LlvmVal {
+        if args.len() != 1 {
+            return LlvmVal::Const("null".to_string());
+        }
+
+        let path = self.emit_expr(&args[0]);
+        let mode_name = self.fresh("file_mode");
+        self.string_constants
+            .push((mode_name.clone(), "rb".to_string(), 3));
+        let mode_ptr = self.fresh("file_mode_ptr");
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds [3 x i8], ptr @{}, i64 0, i64 0",
+            self.l(&mode_ptr),
+            mode_name
+        ));
+
+        let file = self.fresh("file");
+        self.emit_indent(&format!(
+            "{} = call ptr @fopen(ptr {}, ptr {})",
+            self.l(&file),
+            path.to_str(),
+            self.l(&mode_ptr)
+        ));
+
+        self.emit_indent(&format!(
+            "call i32 @fseek(ptr {}, i64 0, i32 2)",
+            self.l(&file)
+        ));
+        let size = self.fresh("file_size");
+        self.emit_indent(&format!(
+            "{} = call i64 @ftell(ptr {})",
+            self.l(&size),
+            self.l(&file)
+        ));
+        self.emit_indent(&format!(
+            "call i32 @fseek(ptr {}, i64 0, i32 0)",
+            self.l(&file)
+        ));
+
+        let alloc_size = self.fresh("file_alloc_size");
+        self.emit_indent(&format!(
+            "{} = add i64 {}, 1",
+            self.l(&alloc_size),
+            self.l(&size)
+        ));
+        let buffer = self.fresh("file_buffer");
+        self.emit_indent(&format!(
+            "{} = call ptr @malloc(i64 {})",
+            self.l(&buffer),
+            self.l(&alloc_size)
+        ));
+        self.emit_indent(&format!(
+            "call i64 @fread(ptr {}, i64 1, i64 {}, ptr {})",
+            self.l(&buffer),
+            self.l(&size),
+            self.l(&file)
+        ));
+        let null_ptr = self.fresh("file_null");
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds i8, ptr {}, i64 {}",
+            self.l(&null_ptr),
+            self.l(&buffer),
+            self.l(&size)
+        ));
+        self.emit_indent(&format!("store i8 0, ptr {}", self.l(&null_ptr)));
+        self.emit_indent(&format!("call i32 @fclose(ptr {})", self.l(&file)));
+
+        LlvmVal::Local(buffer)
+    }
+
+    fn emit_builtin_write_file(&mut self, args: &[Expr]) -> LlvmVal {
+        if args.len() != 2 {
+            return LlvmVal::Const("0".to_string());
+        }
+
+        let path = self.emit_expr(&args[0]);
+        let contents = self.emit_expr(&args[1]);
+        let mode_name = self.fresh("file_mode");
+        self.string_constants
+            .push((mode_name.clone(), "wb".to_string(), 3));
+        let mode_ptr = self.fresh("file_mode_ptr");
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds [3 x i8], ptr @{}, i64 0, i64 0",
+            self.l(&mode_ptr),
+            mode_name
+        ));
+        let file = self.fresh("file");
+        self.emit_indent(&format!(
+            "{} = call ptr @fopen(ptr {}, ptr {})",
+            self.l(&file),
+            path.to_str(),
+            self.l(&mode_ptr)
+        ));
+        let len = self.fresh("write_len");
+        self.emit_indent(&format!(
+            "{} = call i64 @strlen(ptr {})",
+            self.l(&len),
+            contents.to_str()
+        ));
+        let written = self.fresh("written");
+        self.emit_indent(&format!(
+            "{} = call i64 @fwrite(ptr {}, i64 1, i64 {}, ptr {})",
+            self.l(&written),
+            contents.to_str(),
+            self.l(&len),
+            self.l(&file)
+        ));
+        self.emit_indent(&format!("call i32 @fclose(ptr {})", self.l(&file)));
+        let ok = self.fresh("write_ok");
+        self.emit_indent(&format!(
+            "{} = icmp eq i64 {}, {}",
+            self.l(&ok),
+            self.l(&written),
+            self.l(&len)
+        ));
+        let result = self.fresh("write_result");
+        self.emit_indent(&format!(
+            "{} = zext i1 {} to i32",
+            self.l(&result),
+            self.l(&ok)
+        ));
+        LlvmVal::Local(result)
     }
 
     fn emit_string_concat(&mut self, lv: &LlvmVal, rv: &LlvmVal, lt: &Type, rt: &Type) -> LlvmVal {
@@ -1975,7 +2427,17 @@ impl CodeGen {
         LlvmVal::Const("void".to_string())
     }
 
-    fn emit_for_each(&mut self, var: &str, iterable: &Expr, body: &Block) -> LlvmVal {
+    fn emit_for_each(
+        &mut self,
+        var: &str,
+        type_ann: Option<&TypeExpr>,
+        iterable: &Expr,
+        body: &Block,
+    ) -> LlvmVal {
+        if let Expr::RangeLiteral { start, end } = iterable {
+            return self.emit_range_for_each(var, type_ann, start, end, body);
+        }
+
         // For-each is lowered to:
         //   let iter = iterable;
         //   let idx = 0;
@@ -2128,6 +2590,132 @@ impl CodeGen {
         LlvmVal::Const("void".to_string())
     }
 
+    fn emit_range_for_each(
+        &mut self,
+        var: &str,
+        type_ann: Option<&TypeExpr>,
+        start: &Expr,
+        end: &Expr,
+        body: &Block,
+    ) -> LlvmVal {
+        let start_val = self.emit_expr(start);
+        let end_val = self.emit_expr(end);
+        let idx_type = type_ann
+            .map(|type_ann| self.resolve_type_expr_simple(type_ann))
+            .unwrap_or_else(|| {
+                self.common_int_type(
+                    &self.infer_type_of_expr(start),
+                    &self.infer_type_of_expr(end),
+                )
+                .unwrap_or(Type::I64)
+            });
+        let idx_llvm = self.type_to_llvm(&idx_type);
+
+        let idx_alloca = format!("{}_addr", var);
+        self.emit_indent(&format!("{} = alloca {}", self.l(&idx_alloca), idx_llvm));
+        let coerced_start =
+            self.coerce_int_value(&start_val, &self.infer_type_of_expr(start), &idx_type);
+        self.emit_indent(&format!(
+            "store {} {}, ptr {}",
+            idx_llvm,
+            coerced_start,
+            self.l(&idx_alloca)
+        ));
+        self.env.define_var(var.to_string(), idx_type.clone());
+        self.var_allocas.push(var.to_string());
+
+        let end_alloca = self.fresh("range_end_addr");
+        self.emit_indent(&format!("{} = alloca {}", self.l(&end_alloca), idx_llvm));
+        let coerced_end = self.coerce_int_value(&end_val, &self.infer_type_of_expr(end), &idx_type);
+        self.emit_indent(&format!(
+            "store {} {}, ptr {}",
+            idx_llvm,
+            coerced_end,
+            self.l(&end_alloca)
+        ));
+
+        let cond_label = self.fresh_label("range_cond");
+        let body_label = self.fresh_label("range_body");
+        let end_label = self.fresh_label("range_end");
+        let continue_label = cond_label.clone();
+
+        self.emit_indent(&format!("br label %{}", cond_label));
+
+        self.terminated = false;
+        self.emit(&format!("{}:", cond_label));
+        let idx_load = self.fresh("range_idx");
+        self.emit_indent(&format!(
+            "{} = load {}, ptr {}",
+            self.l(&idx_load),
+            idx_llvm,
+            self.l(&idx_alloca)
+        ));
+        let end_load = self.fresh("range_end");
+        self.emit_indent(&format!(
+            "{} = load {}, ptr {}",
+            self.l(&end_load),
+            idx_llvm,
+            self.l(&end_alloca)
+        ));
+        let cmp_name = self.fresh("range_cmp");
+        let cmp_op = if idx_type.is_unsigned_int() {
+            "ult"
+        } else {
+            "slt"
+        };
+        self.emit_indent(&format!(
+            "{} = icmp {} {} {}, {}",
+            self.l(&cmp_name),
+            cmp_op,
+            idx_llvm,
+            self.l(&idx_load),
+            self.l(&end_load)
+        ));
+        self.emit_indent(&format!(
+            "br i1 {}, label %{}, label %{}",
+            self.l(&cmp_name),
+            body_label,
+            end_label
+        ));
+
+        self.terminated = false;
+        self.emit(&format!("{}:", body_label));
+
+        self.loop_end_labels.push(end_label.clone());
+        self.loop_continue_labels.push(continue_label.clone());
+        self.emit_block(body);
+        self.loop_end_labels.pop();
+        self.loop_continue_labels.pop();
+
+        if !self.terminated {
+            let idx_load = self.fresh("range_idx_next");
+            self.emit_indent(&format!(
+                "{} = load {}, ptr {}",
+                self.l(&idx_load),
+                idx_llvm,
+                self.l(&idx_alloca)
+            ));
+            let inc = self.fresh("range_inc");
+            self.emit_indent(&format!(
+                "{} = add {} {}, 1",
+                self.l(&inc),
+                idx_llvm,
+                self.l(&idx_load)
+            ));
+            self.emit_indent(&format!(
+                "store {} {}, ptr {}",
+                idx_llvm,
+                self.l(&inc),
+                self.l(&idx_alloca)
+            ));
+            self.emit_indent(&format!("br label %{}", cond_label));
+        }
+
+        self.terminated = false;
+        self.emit(&format!("{}:", end_label));
+        LlvmVal::Const("void".to_string())
+    }
+
     // =========================================================================
     // Fallible blocks
     // =========================================================================
@@ -2195,6 +2783,177 @@ impl CodeGen {
     // =========================================================================
     // Struct, enum, array, tuple literals
     // =========================================================================
+
+    fn dyn_array_header_type(&self) -> &'static str {
+        "{ i64, i64, ptr }"
+    }
+
+    fn emit_alloc_dyn_array_header(&mut self) -> String {
+        let header = self.fresh("array_header");
+        self.emit_indent(&format!("{} = call ptr @malloc(i64 24)", self.l(&header)));
+        header
+    }
+
+    fn emit_dyn_array_field_ptr(&mut self, header: &LlvmVal, index: usize, prefix: &str) -> String {
+        let ptr = self.fresh(prefix);
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds {}, ptr {}, i32 0, i32 {}",
+            self.l(&ptr),
+            self.dyn_array_header_type(),
+            header.to_str(),
+            index
+        ));
+        ptr
+    }
+
+    fn emit_dyn_array_data_ptr(&mut self, header: &LlvmVal) -> String {
+        let data_field = self.emit_dyn_array_field_ptr(header, 2, "array_data_field");
+        let data = self.fresh("array_data");
+        self.emit_indent(&format!(
+            "{} = load ptr, ptr {}",
+            self.l(&data),
+            self.l(&data_field)
+        ));
+        self.l(&data)
+    }
+
+    fn emit_dyn_array_len(&mut self, header: &LlvmVal) -> LlvmVal {
+        let len_field = self.emit_dyn_array_field_ptr(header, 0, "array_len_field");
+        let len = self.fresh("array_len");
+        self.emit_indent(&format!(
+            "{} = load i64, ptr {}",
+            self.l(&len),
+            self.l(&len_field)
+        ));
+        LlvmVal::Local(len)
+    }
+
+    fn emit_dyn_array_literal(&mut self, elem_type: &Type, elements: &[Expr]) -> LlvmVal {
+        let header = self.emit_alloc_dyn_array_header();
+        let elem_llvm = self.type_to_llvm(elem_type);
+        let count = elements.len();
+        let bytes = (count as u64)
+            .saturating_mul(elem_type.llvm_size() as u64)
+            .max(1);
+        let data = self.fresh("array_storage");
+        self.emit_indent(&format!(
+            "{} = call ptr @malloc(i64 {})",
+            self.l(&data),
+            bytes
+        ));
+
+        self.emit_init_dyn_array_header(&header, count as i64, count as i64, &self.l(&data));
+
+        for (i, elem) in elements.iter().enumerate() {
+            let val = self.emit_expr(elem);
+            let elem_ptr = self.fresh("array_elem");
+            self.emit_indent(&format!(
+                "{} = getelementptr inbounds {}, ptr {}, i64 {}",
+                self.l(&elem_ptr),
+                elem_llvm,
+                self.l(&data),
+                i
+            ));
+            self.emit_indent(&format!(
+                "store {} {}, ptr {}",
+                elem_llvm,
+                val.to_str(),
+                self.l(&elem_ptr)
+            ));
+        }
+
+        LlvmVal::Local(header)
+    }
+
+    fn emit_dyn_array_repeat(&mut self, elem_type: &Type, value: &Expr, count: &Expr) -> LlvmVal {
+        let Expr::Int(count) = count else {
+            return LlvmVal::Const("null".to_string());
+        };
+        let elements: Vec<Expr> = (0..(*count).max(0)).map(|_| value.clone()).collect();
+        self.emit_dyn_array_literal(elem_type, &elements)
+    }
+
+    fn emit_init_dyn_array_header(&mut self, header: &str, len: i64, cap: i64, data: &str) {
+        let header_val = LlvmVal::Local(header.to_string());
+        let len_field = self.emit_dyn_array_field_ptr(&header_val, 0, "array_len_field");
+        self.emit_indent(&format!("store i64 {}, ptr {}", len, self.l(&len_field)));
+        let cap_field = self.emit_dyn_array_field_ptr(&header_val, 1, "array_cap_field");
+        self.emit_indent(&format!("store i64 {}, ptr {}", cap, self.l(&cap_field)));
+        let data_field = self.emit_dyn_array_field_ptr(&header_val, 2, "array_data_field");
+        self.emit_indent(&format!("store ptr {}, ptr {}", data, self.l(&data_field)));
+    }
+
+    fn emit_dyn_array_push(&mut self, header: &LlvmVal, elem_type: &Type, value: &Expr) -> LlvmVal {
+        let elem_llvm = self.type_to_llvm(elem_type);
+        let len = self.emit_dyn_array_len(header);
+        let old_data = self.emit_dyn_array_data_ptr(header);
+        let new_len = self.fresh("array_new_len");
+        self.emit_indent(&format!(
+            "{} = add i64 {}, 1",
+            self.l(&new_len),
+            len.to_str()
+        ));
+        let byte_len = self.fresh("array_byte_len");
+        self.emit_indent(&format!(
+            "{} = mul i64 {}, {}",
+            self.l(&byte_len),
+            self.l(&new_len),
+            elem_type.llvm_size()
+        ));
+        let new_data = self.fresh("array_new_data");
+        self.emit_indent(&format!(
+            "{} = call ptr @malloc(i64 {})",
+            self.l(&new_data),
+            self.l(&byte_len)
+        ));
+        let old_byte_len = self.fresh("array_old_byte_len");
+        self.emit_indent(&format!(
+            "{} = mul i64 {}, {}",
+            self.l(&old_byte_len),
+            len.to_str(),
+            elem_type.llvm_size()
+        ));
+        self.emit_indent(&format!(
+            "call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)",
+            self.l(&new_data),
+            old_data,
+            self.l(&old_byte_len)
+        ));
+
+        let value = self.emit_expr(value);
+        let slot = self.fresh("array_push_slot");
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds {}, ptr {}, i64 {}",
+            self.l(&slot),
+            elem_llvm,
+            self.l(&new_data),
+            len.to_str()
+        ));
+        self.emit_indent(&format!(
+            "store {} {}, ptr {}",
+            elem_llvm,
+            value.to_str(),
+            self.l(&slot)
+        ));
+
+        let new_header = self.emit_alloc_dyn_array_header();
+        self.emit_init_dyn_array_header(&new_header, 0, 0, &self.l(&new_data));
+        let new_header_val = LlvmVal::Local(new_header.clone());
+        let len_field = self.emit_dyn_array_field_ptr(&new_header_val, 0, "array_len_field");
+        self.emit_indent(&format!(
+            "store i64 {}, ptr {}",
+            self.l(&new_len),
+            self.l(&len_field)
+        ));
+        let cap_field = self.emit_dyn_array_field_ptr(&new_header_val, 1, "array_cap_field");
+        self.emit_indent(&format!(
+            "store i64 {}, ptr {}",
+            self.l(&new_len),
+            self.l(&cap_field)
+        ));
+
+        LlvmVal::Local(new_header)
+    }
 
     fn emit_struct_literal(&mut self, type_name: &str, fields: &[(String, Expr)]) -> LlvmVal {
         let struct_name = format!("%{}_struct", type_name);
@@ -2325,6 +3084,43 @@ impl CodeGen {
         LlvmVal::Local(result_name)
     }
 
+    fn emit_repeat_literal(&mut self, value: &Expr, count: &Expr) -> LlvmVal {
+        let Expr::Int(count) = count else {
+            return LlvmVal::Const("null".to_string());
+        };
+        let count = (*count).max(0) as usize;
+        let elem_type = self.infer_type_of_expr(value);
+        let elem_llvm = self.type_to_llvm(&elem_type);
+        let result_name = self.fresh("repeat");
+        self.emit_indent(&format!(
+            "{} = alloca [{} x {}]",
+            self.l(&result_name),
+            count,
+            elem_llvm
+        ));
+
+        for i in 0..count {
+            let val = self.emit_expr(value);
+            let elem_ptr = self.fresh("repptr");
+            self.emit_indent(&format!(
+                "{} = getelementptr inbounds [{} x {}], ptr {}, i32 0, i32 {}",
+                self.l(&elem_ptr),
+                count,
+                elem_llvm,
+                self.l(&result_name),
+                i
+            ));
+            self.emit_indent(&format!(
+                "store {} {}, ptr {}",
+                elem_llvm,
+                val.to_str(),
+                self.l(&elem_ptr)
+            ));
+        }
+
+        LlvmVal::Local(result_name)
+    }
+
     fn emit_tuple_literal(&mut self, elements: &[Expr]) -> LlvmVal {
         let types: Vec<Type> = elements
             .iter()
@@ -2363,6 +3159,54 @@ impl CodeGen {
     // =========================================================================
     // Type conversion helpers
     // =========================================================================
+
+    fn common_int_type(&self, left: &Type, right: &Type) -> Option<Type> {
+        if !left.is_signed_int()
+            && !left.is_unsigned_int()
+            && !right.is_signed_int()
+            && !right.is_unsigned_int()
+        {
+            return None;
+        }
+
+        if left.is_unsigned_int() || right.is_unsigned_int() {
+            return Some(Type::U64);
+        }
+
+        Some(Type::I64)
+    }
+
+    fn coerce_int_value(&mut self, value: &LlvmVal, from: &Type, to: &Type) -> String {
+        if from == to || !from.is_numeric() || !to.is_numeric() {
+            return value.to_str();
+        }
+
+        let from_size = from.llvm_size();
+        let to_size = to.llvm_size();
+        if from_size == to_size {
+            return value.to_str();
+        }
+
+        let cast = self.fresh("int_cast");
+        let op = if from_size < to_size {
+            if from.is_unsigned_int() {
+                "zext"
+            } else {
+                "sext"
+            }
+        } else {
+            "trunc"
+        };
+        self.emit_indent(&format!(
+            "{} = {} {} {} to {}",
+            self.l(&cast),
+            op,
+            self.type_to_llvm(from),
+            value.to_str(),
+            self.type_to_llvm(to)
+        ));
+        self.l(&cast)
+    }
 
     fn type_to_llvm(&self, ty: &Type) -> String {
         match ty {
@@ -2488,23 +3332,12 @@ impl CodeGen {
                     .iter()
                     .map(|a| self.resolve_type_expr_simple(a))
                     .collect();
-                match name.as_str() {
-                    "Array" if resolved.len() == 1 => Type::DynArray(Box::new(resolved[0].clone())),
-                    "Option" if resolved.len() == 1 => Type::Option(Box::new(resolved[0].clone())),
-                    "Result" if resolved.len() == 2 => Type::Result {
-                        ok: Box::new(resolved[0].clone()),
-                        err: Box::new(resolved[1].clone()),
-                    },
-                    "Map" if resolved.len() == 2 => Type::Map {
-                        key: Box::new(resolved[0].clone()),
-                        value: Box::new(resolved[1].clone()),
-                    },
-                    "Set" if resolved.len() == 1 => Type::Set(Box::new(resolved[0].clone())),
-                    _ => Type::Generic {
+                vita_std::resolve_generic_type(name, &resolved)
+                    .and_then(|result| result.ok())
+                    .unwrap_or(Type::Generic {
                         name: name.clone(),
                         args: resolved,
-                    },
-                }
+                    })
             }
             TypeExpr::Array { element, size } => {
                 let elem = self.resolve_type_expr_simple(element);
@@ -2563,6 +3396,21 @@ impl CodeGen {
                     Type::DynArray(Box::new(self.infer_type_of_expr(&elems[0])))
                 }
             }
+            Expr::RangeLiteral { .. } => Type::Generic {
+                name: "Range".to_string(),
+                args: vec![Type::I64],
+            },
+            Expr::RepeatLiteral { value, .. } => {
+                Type::DynArray(Box::new(self.infer_type_of_expr(value)))
+            }
+            Expr::Index { object, .. } => {
+                let object_type = self.infer_type_of_expr(object);
+                match object_type {
+                    Type::Array { element, .. } | Type::DynArray(element) => *element,
+                    Type::Str => Type::Char,
+                    _ => Type::I32,
+                }
+            }
             Expr::TupleLiteral(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.infer_type_of_expr(e)).collect())
             }
@@ -2577,12 +3425,26 @@ impl CodeGen {
                     Type::I32
                 }
             }
-            Expr::MethodCall { method, .. } => self
-                .env
-                .lookup_fn(method)
-                .and_then(|fns| fns.first())
-                .map(|f| f.return_type.clone())
-                .unwrap_or(Type::I32),
+            Expr::MethodCall {
+                receiver, method, ..
+            } => {
+                let receiver_type = self.infer_type_of_expr(receiver);
+                if matches!(receiver_type, Type::DynArray(_)) {
+                    return match method.as_str() {
+                        "len" => Type::I64,
+                        "push" => receiver_type,
+                        _ => Type::I32,
+                    };
+                }
+                self.env
+                    .lookup_fn(method)
+                    .and_then(|fns| {
+                        fns.iter()
+                            .find(|f| f.receiver_type.as_ref() == Some(&receiver_type))
+                    })
+                    .map(|f| f.return_type.clone())
+                    .unwrap_or(Type::I32)
+            }
             Expr::If {
                 then_block,
                 else_block,

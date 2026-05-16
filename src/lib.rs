@@ -5,6 +5,7 @@
 
 pub mod backend;
 pub mod diagnostics;
+pub mod modules;
 pub mod semantics;
 pub mod syntax;
 

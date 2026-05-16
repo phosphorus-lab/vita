@@ -54,6 +54,13 @@ impl Parser {
         self.peek().kind
     }
 
+    fn peek_kind_at(&self, offset: usize) -> TokenKind {
+        self.tokens
+            .get(self.pos + offset)
+            .map(|tok| tok.kind)
+            .unwrap_or(TokenKind::Eof)
+    }
+
     fn advance(&mut self) -> Token {
         let tok = self
             .tokens
@@ -324,13 +331,11 @@ impl Parser {
             }
         }
 
-        // Continue parsing path segments
-        while self.match_kind(TokenKind::Dot).is_some() {
-            if self.peek_kind() == TokenKind::Ident {
-                path.push(self.expect_ident()?);
-            } else {
-                break;
-            }
+        // Continue parsing path segments. Do not consume the dot before a
+        // symbol import (`use module.{ Symbol }`).
+        while self.peek_kind() == TokenKind::Dot && self.peek_kind_at(1) == TokenKind::Ident {
+            self.advance();
+            path.push(self.expect_ident()?);
         }
 
         // Check for alias: `as name`
@@ -415,6 +420,23 @@ impl Parser {
     // --- Type expressions ---
 
     fn parse_type_expr(&mut self) -> Result<TypeExpr> {
+        if self.peek_kind() == TokenKind::KwFn {
+            self.advance();
+            self.expect(TokenKind::LParen)?;
+            let mut params = Vec::new();
+            while self.peek_kind() != TokenKind::RParen {
+                params.push(self.parse_type_expr()?);
+                self.match_kind(TokenKind::Comma);
+            }
+            self.expect(TokenKind::RParen)?;
+            self.expect(TokenKind::Arrow)?;
+            let ret = self.parse_type_expr()?;
+            return Ok(TypeExpr::Fn {
+                params,
+                ret: Box::new(ret),
+            });
+        }
+
         if self.peek_kind() == TokenKind::KwSelf {
             self.advance();
             return Ok(TypeExpr::SelfType);
@@ -824,12 +846,66 @@ impl Parser {
         Ok(args)
     }
 
+    fn current_paren_is_lambda_start(&self) -> bool {
+        if self.peek_kind() != TokenKind::LParen {
+            return false;
+        }
+
+        let mut depth = 0usize;
+        let mut offset = 0usize;
+        loop {
+            match self.peek_kind_at(offset) {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return self.peek_kind_at(offset + 1) == TokenKind::FatArrow;
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            offset += 1;
+        }
+    }
+
+    fn parse_lambda_expr(&mut self) -> Result<Expr> {
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        while self.peek_kind() != TokenKind::RParen {
+            let name = self.expect_ident()?;
+            let type_ann = if self.match_kind(TokenKind::Colon).is_some() {
+                self.parse_type_expr()?
+            } else {
+                TypeExpr::SelfType
+            };
+            let default = if self.match_kind(TokenKind::Eq).is_some() {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            params.push(Param {
+                name,
+                type_ann,
+                default,
+            });
+            self.match_kind(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RParen)?;
+        self.expect(TokenKind::FatArrow)?;
+        let body = self.parse_expr()?;
+        Ok(Expr::Lambda {
+            params,
+            body: Box::new(body),
+        })
+    }
+
     fn parse_primary(&mut self) -> Result<Expr> {
         match self.peek_kind() {
             // Literals
             TokenKind::IntLiteral => {
                 let tok = self.advance();
-                let val: i64 = tok.text.replace('i', "").parse().map_err(|_| {
+                let val: i64 = tok.text.parse().map_err(|_| {
                     CompileError::new(
                         ErrorKind::InvalidNumber(tok.text.clone()),
                         Span::new(tok.line, tok.col, 0),
@@ -906,8 +982,12 @@ impl Parser {
                 }
             }
 
-            // Grouped expression or tuple or unit
+            // Lambda, grouped expression, tuple, or unit
             TokenKind::LParen => {
+                if self.current_paren_is_lambda_start() {
+                    return self.parse_lambda_expr();
+                }
+
                 self.advance();
                 if self.match_kind(TokenKind::RParen).is_some() {
                     return Ok(Expr::Unit);
@@ -931,13 +1011,73 @@ impl Parser {
             // Array literal
             TokenKind::LBracket => {
                 self.advance();
-                let mut elements = Vec::new();
+                if self.match_kind(TokenKind::RBracket).is_some() {
+                    return Ok(Expr::ArrayLiteral(Vec::new()));
+                }
+
+                let first = self.parse_expr()?;
+                if self.match_kind(TokenKind::DotDot).is_some() {
+                    let end = self.parse_expr()?;
+                    self.expect(TokenKind::RBracket)?;
+                    return Ok(Expr::RangeLiteral {
+                        start: Box::new(first),
+                        end: Box::new(end),
+                    });
+                }
+
+                if self.match_kind(TokenKind::Semicolon).is_some() {
+                    let count = self.parse_expr()?;
+                    self.expect(TokenKind::RBracket)?;
+                    return Ok(Expr::RepeatLiteral {
+                        value: Box::new(first),
+                        count: Box::new(count),
+                    });
+                }
+
+                let mut elements = vec![first];
+                self.match_kind(TokenKind::Comma);
                 while self.peek_kind() != TokenKind::RBracket {
                     elements.push(self.parse_expr()?);
                     self.match_kind(TokenKind::Comma);
                 }
+
                 self.expect(TokenKind::RBracket)?;
                 Ok(Expr::ArrayLiteral(elements))
+            }
+
+            // Map or set literal: { key: value, ... } or { value, ... }
+            TokenKind::LBrace => {
+                self.advance();
+                if self.match_kind(TokenKind::RBrace).is_some() {
+                    return Ok(Expr::SetLiteral(Vec::new()));
+                }
+
+                let first = self.parse_expr()?;
+                if self.match_kind(TokenKind::Colon).is_some() {
+                    let value = self.parse_expr()?;
+                    let mut entries = vec![(first, value)];
+                    self.match_kind(TokenKind::Comma);
+
+                    while self.peek_kind() != TokenKind::RBrace {
+                        let key = self.parse_expr()?;
+                        self.expect(TokenKind::Colon)?;
+                        let value = self.parse_expr()?;
+                        entries.push((key, value));
+                        self.match_kind(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RBrace)?;
+                    Ok(Expr::MapLiteral(entries))
+                } else {
+                    let mut elements = vec![first];
+                    self.match_kind(TokenKind::Comma);
+
+                    while self.peek_kind() != TokenKind::RBrace {
+                        elements.push(self.parse_expr()?);
+                        self.match_kind(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RBrace)?;
+                    Ok(Expr::SetLiteral(elements))
+                }
             }
 
             // If expression: ? condition { } !? condition { } ! { }
@@ -1017,12 +1157,14 @@ impl Parser {
             // For-each: *? item: items { }
             TokenKind::StarQuestion => {
                 self.advance();
+                self.match_kind(TokenKind::KwLet);
                 let var = self.expect_ident()?;
                 self.expect(TokenKind::Colon)?;
-                let iterable = self.parse_expr()?;
+                let (type_ann, iterable) = self.parse_foreach_header_after_colon()?;
                 let body = self.parse_block()?;
                 Ok(Expr::ForEach {
                     var,
+                    type_ann,
                     iterable: Box::new(iterable),
                     body: Box::new(body),
                 })
@@ -1154,5 +1296,151 @@ impl Parser {
                 self.span_here(),
             )),
         }
+    }
+
+    fn parse_foreach_header_after_colon(&mut self) -> Result<(Option<TypeExpr>, Expr)> {
+        if self.peek_kind() == TokenKind::LBracket {
+            return Ok((None, self.parse_expr()?));
+        }
+
+        let type_ann = self.parse_type_expr()?;
+        if self.match_kind(TokenKind::Colon).is_some() {
+            let iterable = self.parse_expr()?;
+            return Ok((Some(type_ann), iterable));
+        }
+
+        match type_ann {
+            TypeExpr::Named(name) => Ok((None, Expr::Ident(name))),
+            _ => Err(CompileError::new(
+                ErrorKind::UnexpectedToken {
+                    expected: "':' followed by iterable expression".to_string(),
+                    got: self.peek_kind().to_string(),
+                },
+                self.span_here(),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::syntax::lexer::Lexer;
+
+    fn parse_source(source: &str) -> Vec<Item> {
+        let tokens = Lexer::tokenize(source).unwrap();
+        let mut parser = Parser::new(tokens);
+        parser.parse().unwrap()
+    }
+
+    #[test]
+    fn parses_function_type_annotations() {
+        let items = parse_source("fn apply(f: fn(i32, i32) -> i32) -> i32 { 0 }");
+        let Item::Fn(function) = &items[0] else {
+            panic!("expected function item");
+        };
+
+        assert!(matches!(
+            function.params[0].type_ann,
+            TypeExpr::Fn { ref params, ref ret }
+                if params.len() == 2 && matches!(ret.as_ref(), TypeExpr::Named(name) if name == "i32")
+        ));
+    }
+
+    #[test]
+    fn parses_lambda_expressions() {
+        let items = parse_source("fn main() { let add = (x: i32, y: i32) => x + y; }");
+        let Item::Fn(function) = &items[0] else {
+            panic!("expected function item");
+        };
+
+        let Stmt::Let { value, .. } = &function.body.stmts[0] else {
+            panic!("expected let statement");
+        };
+        assert!(matches!(value, Expr::Lambda { params, .. } if params.len() == 2));
+    }
+
+    #[test]
+    fn parses_map_and_set_literals() {
+        let items = parse_source("fn main() { let m = {\"a\": 1, \"b\": 2}; let s = {1, 2, 3}; }");
+        let Item::Fn(function) = &items[0] else {
+            panic!("expected function item");
+        };
+
+        let Stmt::Let { value: map, .. } = &function.body.stmts[0] else {
+            panic!("expected map let statement");
+        };
+        assert!(matches!(map, Expr::MapLiteral(entries) if entries.len() == 2));
+
+        let Stmt::Let { value: set, .. } = &function.body.stmts[1] else {
+            panic!("expected set let statement");
+        };
+        assert!(matches!(set, Expr::SetLiteral(elements) if elements.len() == 3));
+    }
+
+    #[test]
+    fn parses_range_and_repeat_literals() {
+        let items = parse_source("fn main() { let r = [0..10]; let z = [0; 10]; }");
+        let Item::Fn(function) = &items[0] else {
+            panic!("expected function item");
+        };
+
+        let Stmt::Let { value: range, .. } = &function.body.stmts[0] else {
+            panic!("expected range let statement");
+        };
+        assert!(matches!(range, Expr::RangeLiteral { .. }));
+
+        let Stmt::Let { value: repeat, .. } = &function.body.stmts[1] else {
+            panic!("expected repeat let statement");
+        };
+        assert!(matches!(repeat, Expr::RepeatLiteral { .. }));
+    }
+
+    #[test]
+    fn parses_foreach_let_range() {
+        let items = parse_source("fn main() { *? let i: [0..10] { print(i); }; }");
+        let Item::Fn(function) = &items[0] else {
+            panic!("expected function item");
+        };
+
+        let Stmt::SemiExpr(Expr::ForEach { var, iterable, .. }) = &function.body.stmts[0] else {
+            panic!("expected foreach statement");
+        };
+        assert_eq!(var, "i");
+        assert!(matches!(iterable.as_ref(), Expr::RangeLiteral { .. }));
+    }
+
+    #[test]
+    fn parses_foreach_let_typed_range() {
+        let items = parse_source("fn main() { *? let i: u32: [0..10] { print(i); }; }");
+        let Item::Fn(function) = &items[0] else {
+            panic!("expected function item");
+        };
+
+        let Stmt::SemiExpr(Expr::ForEach {
+            var,
+            type_ann,
+            iterable,
+            ..
+        }) = &function.body.stmts[0]
+        else {
+            panic!("expected foreach statement");
+        };
+        assert_eq!(var, "i");
+        assert!(matches!(type_ann, Some(TypeExpr::Named(name)) if name == "u32"));
+        assert!(matches!(iterable.as_ref(), Expr::RangeLiteral { .. }));
+    }
+
+    #[test]
+    fn parses_symbol_imports() {
+        let items = parse_source("use foo.{ Bar as Baz, Qux }");
+        let Item::Use(use_item) = &items[0] else {
+            panic!("expected use item");
+        };
+
+        assert_eq!(use_item.path, vec!["foo"]);
+        assert_eq!(use_item.symbols.len(), 2);
+        assert_eq!(use_item.symbols[0].name, "Bar");
+        assert_eq!(use_item.symbols[0].alias.as_deref(), Some("Baz"));
     }
 }

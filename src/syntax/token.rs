@@ -85,6 +85,7 @@ pub enum TokenKind {
     Semicolon,   // ;
     Colon,       // :
     Dot,         // .
+    DotDot,      // ..
     Arrow,       // ->
     FatArrow,    // =>
     DoubleColon, // ::
@@ -164,6 +165,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Semicolon => ";",
             TokenKind::Colon => ":",
             TokenKind::Dot => ".",
+            TokenKind::DotDot => "..",
             TokenKind::Arrow => "->",
             TokenKind::FatArrow => "=>",
             TokenKind::DoubleColon => "::",

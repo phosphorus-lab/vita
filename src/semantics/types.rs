@@ -262,7 +262,7 @@ impl TypeEnv {
             vars: HashMap::new(),
             parent: None,
         };
-        env.register_builtins();
+        crate::semantics::std::register(&mut env);
         env
     }
 
@@ -302,42 +302,34 @@ impl TypeEnv {
         self.functions.entry(name).or_default().push(info);
     }
 
-    fn register_builtins(&mut self) {
-        // Register print and other builtins
+    pub fn define_function(&mut self, name: &str, params: Vec<(String, Type)>, return_type: Type) {
         self.define_fn(
-            "print".to_string(),
+            name.to_string(),
             FnInfo {
-                name: "print".to_string(),
-                params: vec![("msg".to_string(), Type::Str)],
-                return_type: Type::Unit,
+                name: name.to_string(),
+                params,
+                return_type,
                 is_pub: true,
                 receiver_type: None,
             },
         );
+    }
 
-        // Register Option type
-        self.define_type(
-            "Option".to_string(),
-            TypeInfo::Enum {
-                name: "Option".to_string(),
-                generics: vec!["T".to_string()],
-                variants: vec![
-                    ("Some".to_string(), Some(Type::Var("T".to_string()))),
-                    ("None".to_string(), None),
-                ],
-            },
-        );
-
-        // Register Result type
-        self.define_type(
-            "Result".to_string(),
-            TypeInfo::Enum {
-                name: "Result".to_string(),
-                generics: vec!["T".to_string(), "E".to_string()],
-                variants: vec![
-                    ("Ok".to_string(), Some(Type::Var("T".to_string()))),
-                    ("Err".to_string(), Some(Type::Var("E".to_string()))),
-                ],
+    pub fn define_method(
+        &mut self,
+        receiver_type: Type,
+        name: &str,
+        params: Vec<(String, Type)>,
+        return_type: Type,
+    ) {
+        self.define_fn(
+            name.to_string(),
+            FnInfo {
+                name: name.to_string(),
+                params,
+                return_type,
+                is_pub: true,
+                receiver_type: Some(receiver_type),
             },
         );
     }

@@ -285,6 +285,7 @@ pub enum Expr {
     // For-each: *? item: items { }
     ForEach {
         var: String,
+        type_ann: Option<TypeExpr>,
         iterable: Box<Expr>,
         body: Box<Block>,
     },
@@ -310,6 +311,18 @@ pub enum Expr {
 
     // Array literal: [1, 2, 3]
     ArrayLiteral(Vec<Expr>),
+
+    // Range literal: [start..end], end-exclusive.
+    RangeLiteral {
+        start: Box<Expr>,
+        end: Box<Expr>,
+    },
+
+    // Repeat literal: [value; count].
+    RepeatLiteral {
+        value: Box<Expr>,
+        count: Box<Expr>,
+    },
 
     // Tuple literal: (a, b, c)
     TupleLiteral(Vec<Expr>),

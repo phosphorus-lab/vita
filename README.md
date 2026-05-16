@@ -19,7 +19,11 @@ The current compiler includes support for:
 - `spec` and `impl` declarations
 - Control flow with `if`, `else if`, `else`, and `match`
 - Loop constructs including `loop`, `while`, and `for`-style iteration
-- Arrays, tuples, and literals
+- Arrays, tuples, maps, sets, and literals
+- Range literals such as `[0..n]` for end-exclusive iteration
+- Repeat literals such as `[0; n]` for `n` copies of a value
+- Standard type constructors such as `Array<T>`, `Map<K, V>`, `Set<T>`, `Option<T>`, and `Result<T, E>`
+- Basic primitive methods such as `str.len()`, `str.is_empty()`, and signed integer `.abs()`
 - Basic builtin output via `print`
 
 ## Requirements
@@ -46,8 +50,10 @@ src/
 ├── diagnostics/
 │   ├── error.rs          # compiler errors and spans
 │   └── mod.rs
+├── modules.rs            # source loading and local use/import resolution
 ├── semantics/
 │   ├── checker.rs        # type checker / semantic analysis
+│   ├── std.rs            # standard types, builtin functions, and primitive methods
 │   ├── types.rs          # type system and type environment
 │   └── mod.rs
 ├── syntax/
@@ -92,6 +98,10 @@ During development, you can run it through Cargo:
 ```sh
 cargo run -- <source.vita> [options]
 ```
+
+Local `use` imports are loaded recursively from sibling `.vita` files or
+`mod.vita` files. For example, `use helper` checks for `helper.vita` and
+`helper/mod.vita` beside the importing file.
 
 ## Output mode quick reference
 
@@ -204,7 +214,10 @@ cargo run -- examples/hello.vita --emit-obj -o build/hello.o
 
 ```vita
 fn main() -> i32 {
-    print("Hello, World")
+    let text = "Hello";
+    *? let i: [0..text.len()] {
+        print(text[i]);
+    };
     0
 }
 ```

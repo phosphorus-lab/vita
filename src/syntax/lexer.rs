@@ -295,7 +295,12 @@ impl Lexer {
             }
             '.' => {
                 self.advance();
-                TokenKind::Dot
+                if self.peek() == Some('.') {
+                    self.advance();
+                    TokenKind::DotDot
+                } else {
+                    TokenKind::Dot
+                }
             }
             '_' => {
                 self.advance();
@@ -390,26 +395,27 @@ impl Lexer {
                 }
                 // Not followed by digit: treat as dot operator
                 break;
-            } else if ch == 'u' || ch == 'i' || ch == 'f' {
-                // Type suffix: 5u, 42i32, 3.14f32
-                text.push(ch);
-                self.advance();
-                // Consume remaining digits in the suffix
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() {
-                        text.push(c);
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-                break;
             } else {
                 break;
             }
         }
 
-        let kind = if is_float || text.contains('f') {
+        if matches!(self.peek(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_') {
+            while let Some(ch) = self.peek() {
+                if ch.is_alphanumeric() || ch == '_' {
+                    text.push(ch);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            return Err(CompileError::new(
+                ErrorKind::InvalidNumber(text),
+                Span::new(line, col, self.pos),
+            ));
+        }
+
+        let kind = if is_float {
             TokenKind::FloatLiteral
         } else {
             TokenKind::IntLiteral
@@ -553,5 +559,12 @@ mod tests {
     fn test_float_literal() {
         let tokens = Lexer::tokenize("3.14").unwrap();
         assert_eq!(tokens[0].kind, TokenKind::FloatLiteral);
+    }
+
+    #[test]
+    fn test_numeric_suffixes_are_rejected() {
+        assert!(Lexer::tokenize("42i32").is_err());
+        assert!(Lexer::tokenize("42u64").is_err());
+        assert!(Lexer::tokenize("2.5f32").is_err());
     }
 }

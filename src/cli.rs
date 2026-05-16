@@ -6,9 +6,8 @@ use std::path::Path;
 use std::process;
 
 use vita::backend::codegen::CodeGen;
+use vita::modules;
 use vita::semantics::checker::TypeChecker;
-use vita::syntax::lexer::Lexer;
-use vita::syntax::parser::Parser;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -113,29 +112,11 @@ fn main() {
         emit_exe = true;
     }
 
-    let source = match fs::read_to_string(&source_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error reading '{}': {}", source_path, e);
-            process::exit(1);
-        }
-    };
-
-    // Phase 1: Lexing
-    let tokens = match Lexer::tokenize(&source) {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            eprintln!("Lexer error: {}", e);
-            process::exit(1);
-        }
-    };
-
-    // Phase 2: Parsing
-    let mut parser = Parser::new(tokens);
-    let items = match parser.parse() {
+    // Phase 1-2: Source loading, lexing, and parsing
+    let items = match modules::load_items(&source_path) {
         Ok(items) => items,
         Err(e) => {
-            eprintln!("Parse error: {}", e);
+            eprintln!("Load error: {}", e);
             process::exit(1);
         }
     };
