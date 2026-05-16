@@ -65,6 +65,7 @@ pub enum ErrorKind {
     NotAFunction(String),
     AmbiguousMethod(String),
     UnknownSpec(String),
+    CannotAssignConst(String),
 
     // Codegen
     UnsupportedFeature(String),
@@ -142,6 +143,9 @@ impl fmt::Display for ErrorKind {
                 write!(f, "ambiguous method '{}': multiple candidates", n)
             }
             ErrorKind::UnknownSpec(s) => write!(f, "unknown spec '{}'", s),
+            ErrorKind::CannotAssignConst(name) => {
+                write!(f, "cannot assign to constant '{}'", name)
+            }
             ErrorKind::UnsupportedFeature(feat) => {
                 write!(f, "unsupported feature: {}", feat)
             }

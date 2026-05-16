@@ -12,6 +12,7 @@ pub enum Item {
     Impl(ImplItem),
     Fn(FnItem),
     Use(UseItem),
+    Global(GlobalItem),
 }
 
 /// A `def` data type definition.
@@ -108,6 +109,15 @@ pub struct UseSymbol {
     pub alias: Option<String>,
 }
 
+/// A top-level `let` or `const` binding.
+#[derive(Debug, Clone)]
+pub struct GlobalItem {
+    pub name: String,
+    pub type_ann: Option<TypeExpr>,
+    pub value: Expr,
+    pub is_const: bool,
+}
+
 /// A type expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
@@ -187,6 +197,7 @@ pub enum Stmt {
         name: String,
         type_ann: Option<TypeExpr>,
         value: Expr,
+        is_const: bool,
     },
     Expr(Expr),
     SemiExpr(Expr), // expression with trailing semicolon

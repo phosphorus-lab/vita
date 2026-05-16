@@ -122,6 +122,8 @@ impl Parser {
             TokenKind::KwSpec => self.parse_spec().map(Item::Spec),
             TokenKind::KwImpl => self.parse_impl().map(Item::Impl),
             TokenKind::KwFn => self.parse_fn_item(false).map(Item::Fn),
+            TokenKind::KwLet => self.parse_global(false).map(Item::Global),
+            TokenKind::KwConst => self.parse_global(true).map(Item::Global),
             TokenKind::KwPub => {
                 self.advance(); // consume `pub`
                 match self.peek_kind() {
@@ -138,12 +140,35 @@ impl Parser {
             TokenKind::KwUse => self.parse_use().map(Item::Use),
             _ => Err(CompileError::new(
                 ErrorKind::UnexpectedToken {
-                    expected: "item (def, enum, spec, impl, fn, use)".to_string(),
+                    expected: "item (def, enum, spec, impl, fn, use, let, const)".to_string(),
                     got: self.peek_kind().to_string(),
                 },
                 self.span_here(),
             )),
         }
+    }
+
+    fn parse_global(&mut self, is_const: bool) -> Result<GlobalItem> {
+        if is_const {
+            self.expect(TokenKind::KwConst)?;
+        } else {
+            self.expect(TokenKind::KwLet)?;
+        }
+        let name = self.expect_ident()?;
+        let type_ann = if self.match_kind(TokenKind::Colon).is_some() {
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        self.match_kind(TokenKind::Semicolon);
+        Ok(GlobalItem {
+            name,
+            type_ann,
+            value,
+            is_const,
+        })
     }
 
     fn parse_def(&mut self) -> Result<DefItem> {
@@ -504,7 +529,7 @@ impl Parser {
 
         while self.peek_kind() != TokenKind::RBrace {
             // Check for let binding (statement form)
-            if self.peek_kind() == TokenKind::KwLet {
+            if self.peek_kind() == TokenKind::KwLet || self.peek_kind() == TokenKind::KwConst {
                 stmts.push(self.parse_let_stmt()?);
                 continue;
             }
@@ -557,7 +582,12 @@ impl Parser {
     }
 
     fn parse_let_stmt(&mut self) -> Result<Stmt> {
-        self.expect(TokenKind::KwLet)?;
+        let is_const = if self.match_kind(TokenKind::KwConst).is_some() {
+            true
+        } else {
+            self.expect(TokenKind::KwLet)?;
+            false
+        };
         let name = self.expect_ident()?;
         let type_ann = if self.match_kind(TokenKind::Colon).is_some() {
             Some(self.parse_type_expr()?)
@@ -571,6 +601,7 @@ impl Parser {
             name,
             type_ann,
             value,
+            is_const,
         })
     }
 

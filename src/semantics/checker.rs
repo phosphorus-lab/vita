@@ -6,6 +6,7 @@ use crate::diagnostics::error::{CompileError, ErrorKind, Result, Span};
 use crate::semantics::std as vita_std;
 use crate::semantics::types::{FnInfo, Type, TypeEnv, TypeInfo};
 use crate::syntax::ast::*;
+use crate::syntax::ast::{BinOp, UnOp};
 
 fn explicit_method_param_count(function: &FnInfo) -> usize {
     function.params.len()
@@ -251,11 +252,70 @@ impl TypeChecker {
                     },
                 );
             }
+            Item::Global(global) => {
+                if !Self::is_const_expr(&global.value) {
+                    return Err(CompileError::new(
+                        ErrorKind::UnsupportedFeature(
+                            "global initializers currently must be constant expressions"
+                                .to_string(),
+                        ),
+                        Span::zero(),
+                    ));
+                }
+                let value_type = self.infer_expr_type_in_env(&self.env, &global.value)?;
+                let binding_type = if let Some(type_ann) = &global.type_ann {
+                    let annotated = self.resolve_type_expr(type_ann)?;
+                    self.expect_type(&annotated, &value_type)?;
+                    annotated
+                } else {
+                    value_type
+                };
+                if global.is_const {
+                    self.env.define_const_var(global.name.clone(), binding_type);
+                } else {
+                    self.env.define_var(global.name.clone(), binding_type);
+                }
+            }
             Item::Use(_) => {
                 // Use items are handled at the module level; skip for now
             }
         }
         Ok(())
+    }
+
+    fn is_const_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) | Expr::Char(_) => true,
+            Expr::Grouped(inner) => Self::is_const_expr(inner),
+            Expr::Unary { op, operand } => match op {
+                UnOp::Neg => matches!(operand.as_ref(), Expr::Int(_) | Expr::Float(_)),
+                UnOp::Not => matches!(operand.as_ref(), Expr::Bool(_)),
+            },
+            Expr::Binary { op, left, right } => {
+                Self::is_const_expr(left)
+                    && Self::is_const_expr(right)
+                    && match op {
+                        BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Eq
+                        | BinOp::Neq
+                        | BinOp::Lt
+                        | BinOp::Gt
+                        | BinOp::LtEq
+                        | BinOp::GtEq
+                        | BinOp::And
+                        | BinOp::Or
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr => true,
+                        BinOp::Div | BinOp::Mod => false,
+                    }
+            }
+            _ => false,
+        }
     }
 
     fn check_item_body(&self, item: &Item) -> Result<()> {
@@ -273,6 +333,7 @@ impl TypeChecker {
                     })?;
                 self.check_fn_body(fn_item, fn_info.return_type.clone(), None)
             }
+            Item::Global(_) | Item::Use(_) | Item::Def(_) | Item::Enum(_) | Item::Spec(_) => Ok(()),
             Item::Impl(impl_item) => {
                 let receiver_type = Type::Named(impl_item.target_type.clone());
                 for method in &impl_item.methods {
@@ -297,7 +358,6 @@ impl TypeChecker {
                 }
                 Ok(())
             }
-            _ => Ok(()),
         }
     }
 
@@ -364,6 +424,7 @@ impl TypeChecker {
                 name,
                 type_ann,
                 value,
+                is_const,
             } => {
                 let value_type = self.infer_expr_type_in_env(env, value)?;
                 let binding_type = if let Some(type_ann) = type_ann {
@@ -373,7 +434,11 @@ impl TypeChecker {
                 } else {
                     value_type
                 };
-                env.define_var(name.clone(), binding_type);
+                if *is_const {
+                    env.define_const_var(name.clone(), binding_type);
+                } else {
+                    env.define_var(name.clone(), binding_type);
+                }
                 Ok(false)
             }
             Stmt::Expr(expr) | Stmt::SemiExpr(expr) => {
@@ -429,6 +494,14 @@ impl TypeChecker {
                 self.check_binary_type(*op, &left_type, &right_type)
             }
             Expr::Assign { target, value } => {
+                if let Expr::Ident(name) = target.as_ref() {
+                    if env.is_const_var(name) {
+                        return Err(CompileError::new(
+                            ErrorKind::CannotAssignConst(name.clone()),
+                            Span::zero(),
+                        ));
+                    }
+                }
                 let target_type = self.infer_assignment_target_type(env, target)?;
                 let value_type = self.infer_expr_type_in_env(env, value)?;
                 self.expect_type(&target_type, &value_type)?;
@@ -1075,13 +1148,18 @@ impl TypeChecker {
                 name,
                 type_ann,
                 value,
+                is_const,
             } = stmt
             {
                 let ty = type_ann
                     .as_ref()
                     .and_then(|t| self.resolve_type_expr(t).ok())
                     .unwrap_or_else(|| self.infer_expr_type(value));
-                self.env.define_var(name.clone(), ty);
+                if *is_const {
+                    self.env.define_const_var(name.clone(), ty);
+                } else {
+                    self.env.define_var(name.clone(), ty);
+                }
             }
         }
         // Also register the tail if it's a let-like pattern
@@ -1381,6 +1459,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_debug_io_builtins() {
+        let source = r#"
+            fn main() {
+                log("hello");
+                log(42);
+                log(true);
+                let text = inp();
+                log(text);
+            }
+        "#;
+
+        assert!(check_source(source).is_ok());
+    }
+
+    #[test]
     fn rejects_undefined_local_names_in_bodies() {
         let source = r#"
             fn main() {
@@ -1390,6 +1483,106 @@ mod tests {
 
         let err = check_source(source).expect_err("undefined names should fail");
         assert!(matches!(err.kind, ErrorKind::UndefinedName(name) if name == "missing"));
+    }
+
+    #[test]
+    fn accepts_global_let_bindings() {
+        let source = r#"
+            let counter: i32 = 41;
+
+            fn main() {
+                counter = counter + 1;
+                print(counter);
+            }
+        "#;
+
+        assert!(check_source(source).is_ok());
+    }
+
+    #[test]
+    fn accepts_const_bindings() {
+        let source = r#"
+            const answer: i32 = 42;
+
+            fn main() {
+                const local: i32 = answer;
+                print(local);
+            }
+        "#;
+
+        assert!(check_source(source).is_ok());
+    }
+
+    #[test]
+    fn rejects_global_const_reassignment() {
+        let source = r#"
+            const answer: i32 = 42;
+
+            fn main() {
+                answer = 7;
+            }
+        "#;
+
+        let err = check_source(source).expect_err("const reassignment should fail");
+        assert!(matches!(err.kind, ErrorKind::CannotAssignConst(name) if name == "answer"));
+    }
+
+    #[test]
+    fn rejects_local_const_reassignment() {
+        let source = r#"
+            fn main() {
+                const value: i32 = 1;
+                value = 2;
+            }
+        "#;
+
+        let err = check_source(source).expect_err("const reassignment should fail");
+        assert!(matches!(err.kind, ErrorKind::CannotAssignConst(name) if name == "value"));
+    }
+
+    #[test]
+    fn rejects_name_references_in_global_initializers_for_now() {
+        let source = r#"
+            let answer: i32 = 40 + 2;
+            const enabled: bool = answer == 42;
+
+            fn main() {
+                print(answer);
+            }
+        "#;
+
+        let err = check_source(source).expect_err("global const expressions cannot reference names");
+        assert!(matches!(err.kind, ErrorKind::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn accepts_literal_constant_expression_global_initializers() {
+        let source = r#"
+            let answer: i32 = (40 + 2) * 1;
+            const enabled: bool = 40 + 2 == 42;
+
+            fn main() {
+                print(answer);
+                print(enabled);
+            }
+        "#;
+
+        assert!(check_source(source).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_constant_global_initializers() {
+        let source = r#"
+            fn value() -> i32 { 42 }
+            let answer: i32 = value();
+
+            fn main() {
+                print(answer);
+            }
+        "#;
+
+        let err = check_source(source).expect_err("global initializers must be constant");
+        assert!(matches!(err.kind, ErrorKind::UnsupportedFeature(_)));
     }
 
     #[test]

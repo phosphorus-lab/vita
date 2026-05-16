@@ -10,9 +10,11 @@
 //! - Struct types are emitted as named LLVM struct types
 //! - Enums use tagged union representation: { i32 tag, [max_payload x i8] }
 
+use crate::backend::os;
 use crate::semantics::std as vita_std;
 use crate::semantics::types::{Type, TypeEnv, TypeInfo};
 use crate::syntax::ast::*;
+use crate::syntax::ast::{BinOp, UnOp};
 
 /// An LLVM IR value reference (e.g., `%x`, `@global`, `42`).
 #[derive(Debug, Clone)]
@@ -95,7 +97,12 @@ impl CodeGen {
             self.emit_type_decl(item);
         }
 
-        // Second pass: collect all functions and emit them
+        // Second pass: emit global bindings
+        for item in items {
+            self.emit_global(item);
+        }
+
+        // Third pass: collect all functions and emit them
         for item in items {
             self.emit_item(item);
         }
@@ -300,6 +307,166 @@ impl CodeGen {
         }
     }
 
+    fn emit_global(&mut self, item: &Item) {
+        let Item::Global(global) = item else {
+            return;
+        };
+
+        let ty = global
+            .type_ann
+            .as_ref()
+            .map(|t| self.resolve_type_expr_simple(t))
+            .unwrap_or_else(|| self.infer_type_of_expr(&global.value));
+        let llvm_type = self.type_to_llvm(&ty);
+        let linkage = if global.is_const { "constant" } else { "global" };
+        let value = self.global_initializer(&global.value, &ty);
+        self.emit(&format!(
+            "@{} = {} {} {}",
+            global.name, linkage, llvm_type, value
+        ));
+    }
+
+    fn global_initializer(&mut self, expr: &Expr, ty: &Type) -> String {
+        match ty {
+            Type::Bool => self
+                .eval_const_bool(expr)
+                .map(|value| {
+                    if value {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }
+                })
+                .unwrap_or_else(|| self.zero_initializer(ty)),
+            Type::F16 | Type::F32 | Type::F64 | Type::F128 => self
+                .eval_const_float(expr)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| self.zero_initializer(ty)),
+            Type::Char => self
+                .eval_const_int(expr)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| self.zero_initializer(ty)),
+            Type::Str => match expr {
+                Expr::String(value) => {
+                    let const_name = self.fresh("str");
+                    let len = value.len() + 1;
+                    self.string_constants
+                        .push((const_name.clone(), value.clone(), len));
+                    format!("@{}", const_name)
+                }
+                _ => self.zero_initializer(ty),
+            },
+            _ => self
+                .eval_const_int(expr)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| self.zero_initializer(ty)),
+        }
+    }
+
+    fn eval_const_int(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Int(value) => Some(*value),
+            Expr::Char(value) => Some(*value as i64),
+            Expr::Grouped(inner) => self.eval_const_int(inner),
+            Expr::Unary { op, operand } => match op {
+                UnOp::Neg => self.eval_const_int(operand).map(|value| -value),
+                UnOp::Not => None,
+            },
+            Expr::Binary { op, left, right } => {
+                let l = self.eval_const_int(left)?;
+                let r = self.eval_const_int(right)?;
+                match op {
+                    BinOp::Add => Some(l + r),
+                    BinOp::Sub => Some(l - r),
+                    BinOp::Mul => Some(l * r),
+                    BinOp::Div if r != 0 => Some(l / r),
+                    BinOp::Mod if r != 0 => Some(l % r),
+                    BinOp::BitAnd => Some(l & r),
+                    BinOp::BitOr => Some(l | r),
+                    BinOp::BitXor => Some(l ^ r),
+                    BinOp::Shl if r >= 0 => Some(l << r),
+                    BinOp::Shr if r >= 0 => Some(l >> r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_const_float(&self, expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::Float(value) => Some(*value),
+            Expr::Int(value) => Some(*value as f64),
+            Expr::Grouped(inner) => self.eval_const_float(inner),
+            Expr::Unary { op, operand } => match op {
+                UnOp::Neg => self.eval_const_float(operand).map(|value| -value),
+                UnOp::Not => None,
+            },
+            Expr::Binary { op, left, right } => {
+                let l = self.eval_const_float(left)?;
+                let r = self.eval_const_float(right)?;
+                match op {
+                    BinOp::Add => Some(l + r),
+                    BinOp::Sub => Some(l - r),
+                    BinOp::Mul => Some(l * r),
+                    BinOp::Div => Some(l / r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_const_bool(&self, expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::Bool(value) => Some(*value),
+            Expr::Grouped(inner) => self.eval_const_bool(inner),
+            Expr::Unary { op, operand } => match op {
+                UnOp::Not => self.eval_const_bool(operand).map(|value| !value),
+                UnOp::Neg => None,
+            },
+            Expr::Binary { op, left, right } => match op {
+                BinOp::And => Some(self.eval_const_bool(left)? && self.eval_const_bool(right)?),
+                BinOp::Or => Some(self.eval_const_bool(left)? || self.eval_const_bool(right)?),
+                BinOp::Eq => {
+                    if let (Some(l), Some(r)) =
+                        (self.eval_const_int(left), self.eval_const_int(right))
+                    {
+                        Some(l == r)
+                    } else {
+                        Some(self.eval_const_bool(left)? == self.eval_const_bool(right)?)
+                    }
+                }
+                BinOp::Neq => {
+                    if let (Some(l), Some(r)) =
+                        (self.eval_const_int(left), self.eval_const_int(right))
+                    {
+                        Some(l != r)
+                    } else {
+                        Some(self.eval_const_bool(left)? != self.eval_const_bool(right)?)
+                    }
+                }
+                BinOp::Lt => Some(self.eval_const_int(left)? < self.eval_const_int(right)?),
+                BinOp::Gt => Some(self.eval_const_int(left)? > self.eval_const_int(right)?),
+                BinOp::LtEq => Some(self.eval_const_int(left)? <= self.eval_const_int(right)?),
+                BinOp::GtEq => Some(self.eval_const_int(left)? >= self.eval_const_int(right)?),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn zero_initializer(&self, ty: &Type) -> String {
+        match ty {
+            Type::Bool => "false".to_string(),
+            Type::F16 | Type::F32 | Type::F64 | Type::F128 => "0.0".to_string(),
+            Type::Str | Type::DynArray(_) | Type::Map { .. } | Type::Set(_) | Type::Fn { .. } => {
+                "null".to_string()
+            }
+            _ => "0".to_string(),
+        }
+    }
+
     fn emit_function(&mut self, fn_item: &FnItem) {
         self.current_fn = fn_item.name.clone();
         let is_main = fn_item.name == "main";
@@ -481,6 +648,7 @@ impl CodeGen {
                 name,
                 type_ann,
                 value,
+                ..
             } => {
                 let ty = type_ann
                     .as_ref()
@@ -594,16 +762,19 @@ impl CodeGen {
 
             // --- Variable reference ---
             Expr::Ident(name) => {
-                // Load from alloca
-                let alloca_name = format!("{}_addr", name);
                 let var_type = self.env.lookup_var(name).unwrap_or(Type::I32);
                 let llvm_type = self.type_to_llvm(&var_type);
                 let load_name = self.fresh(name);
+                let ptr = if self.var_allocas.iter().any(|local| local == name) {
+                    self.l(&format!("{}_addr", name))
+                } else {
+                    format!("@{}", name)
+                };
                 self.emit_indent(&format!(
                     "{} = load {}, ptr {}",
                     self.l(&load_name),
                     llvm_type,
-                    self.l(&alloca_name)
+                    ptr
                 ));
                 LlvmVal::Local(load_name)
             }
@@ -621,12 +792,16 @@ impl CodeGen {
                 let llvm_type = self.type_to_llvm(&val_type);
 
                 if let Expr::Ident(name) = target.as_ref() {
-                    let alloca_name = format!("{}_addr", name);
+                    let ptr = if self.var_allocas.iter().any(|local| local == name) {
+                        self.l(&format!("{}_addr", name))
+                    } else {
+                        format!("@{}", name)
+                    };
                     self.emit_indent(&format!(
                         "store {} {}, ptr {}",
                         llvm_type,
                         val.to_str(),
-                        self.l(&alloca_name)
+                        ptr
                     ));
                 }
                 val
@@ -1139,6 +1314,12 @@ impl CodeGen {
                 "print" => {
                     return self.emit_builtin_print(args);
                 }
+                "log" => {
+                    return self.emit_builtin_log(args);
+                }
+                "inp" => {
+                    return self.emit_builtin_inp(args);
+                }
                 "read_file" => {
                     return self.emit_builtin_read_file(args);
                 }
@@ -1583,6 +1764,46 @@ impl CodeGen {
             }
         }
         LlvmVal::Const("void".to_string())
+    }
+
+    fn emit_builtin_log(&mut self, args: &[Expr]) -> LlvmVal {
+        match os::log_lowering(os::current()) {
+            os::IoLowering::Libc => self.emit_builtin_print(args),
+            os::IoLowering::LinuxSyscall
+            | os::IoLowering::MacosSyscall
+            | os::IoLowering::WindowsApi
+            | os::IoLowering::Placeholder => {
+                // Placeholder until direct syscall/API lowering is implemented.
+                self.emit_builtin_print(args)
+            }
+        }
+    }
+
+    fn emit_builtin_inp(&mut self, args: &[Expr]) -> LlvmVal {
+        if !args.is_empty() {
+            return LlvmVal::Const("null".to_string());
+        }
+
+        match os::inp_lowering(os::current()) {
+            os::IoLowering::LinuxSyscall
+            | os::IoLowering::MacosSyscall
+            | os::IoLowering::WindowsApi => {
+                // Future: lower to OS-specific stdin syscall/API.
+            }
+            os::IoLowering::Libc | os::IoLowering::Placeholder => {
+                // Placeholder below returns an empty string.
+            }
+        }
+
+        let const_name = self.fresh("inp_empty");
+        self.string_constants.push((const_name.clone(), "".to_string(), 1));
+        let ptr_name = self.fresh("inp_empty_ptr");
+        self.emit_indent(&format!(
+            "{} = getelementptr inbounds [1 x i8], ptr @{}, i64 0, i64 0",
+            self.l(&ptr_name),
+            const_name
+        ));
+        LlvmVal::Local(ptr_name)
     }
 
     fn emit_builtin_read_file(&mut self, args: &[Expr]) -> LlvmVal {

@@ -1,6 +1,6 @@
 //! Type system definitions for the Vita language.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// A resolved type in the Vita type system.
@@ -244,6 +244,8 @@ pub struct TypeEnv {
     pub functions: HashMap<String, Vec<FnInfo>>,
     /// Variable bindings in scope.
     pub vars: HashMap<String, Type>,
+    /// Names declared with `const`.
+    pub const_vars: HashSet<String>,
     /// Parent scope (for nested scopes).
     pub parent: Option<Box<TypeEnv>>,
 }
@@ -260,6 +262,7 @@ impl TypeEnv {
             types: HashMap::new(),
             functions: HashMap::new(),
             vars: HashMap::new(),
+            const_vars: HashSet::new(),
             parent: None,
         };
         crate::semantics::std::register(&mut env);
@@ -271,6 +274,7 @@ impl TypeEnv {
             types: self.types.clone(),
             functions: self.functions.clone(),
             vars: HashMap::new(),
+            const_vars: HashSet::new(),
             parent: Some(Box::new(self.clone())),
         }
     }
@@ -282,6 +286,14 @@ impl TypeEnv {
             .or_else(|| self.parent.as_ref().and_then(|p| p.lookup_var(name)))
     }
 
+    pub fn is_const_var(&self, name: &str) -> bool {
+        self.const_vars.contains(name)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_const_var(name))
+    }
+
     pub fn lookup_type(&self, name: &str) -> Option<TypeInfo> {
         self.types.get(name).cloned()
     }
@@ -291,6 +303,12 @@ impl TypeEnv {
     }
 
     pub fn define_var(&mut self, name: String, ty: Type) {
+        self.const_vars.remove(&name);
+        self.vars.insert(name, ty);
+    }
+
+    pub fn define_const_var(&mut self, name: String, ty: Type) {
+        self.const_vars.insert(name.clone());
         self.vars.insert(name, ty);
     }
 
